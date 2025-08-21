@@ -52,7 +52,7 @@ export default async function handler(req, res) {
   const { token } = req.query;
   try {
     const email = parseToken(token);
-    await suppress(email);
+    await suppress(email);// await suppress(email);
     if (req.method === "POST") return res.status(200).end(); // Gmail/Yahoo one-click
     const url = new URL(CONFIRM_URL);
     url.searchParams.set("email", email);
