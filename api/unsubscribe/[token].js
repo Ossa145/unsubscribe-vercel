@@ -1,71 +1,69 @@
+// api/unsubscribe/[token].js
 import crypto from "crypto";
-import pg from "pg";
 
-const {
-  UNSUB_SECRET = "",
-  CONFIRM_URL = "https://appshaiskn.com/pages/unsubscribe",
-  DATABASE_URL = ""
-} = process.env;
+const UNSUB_SECRET = process.env.UNSUB_SECRET || "3ExsYR4nlnttgnHxpDDKM5V0JNQpJKlR3JuvqyOXTAM"; 
 
-const pool = DATABASE_URL
-  ? new pg.Pool({ connectionString: DATABASE_URL, ssl: { require: true, rejectUnauthorized: false } })
-  : null;
-
-// base64url( rawJSON . HMAC-SHA256(rawJSON, secret) )
-function parseToken(token) {
-  if (!token) throw new Error("missing_token");
-  if (!UNSUB_SECRET) throw new Error("missing_secret");
-  const pad = "=".repeat((4 - (token.length % 4)) % 4);
-  const buf = Buffer.from(token + pad, "base64url");
-  const dot = buf.lastIndexOf(46); // "."
-  if (dot < 0) throw new Error("format");
-  const raw = buf.subarray(0, dot);
-  const sig = buf.subarray(dot + 1);
-  const expSig = crypto.createHmac("sha256", UNSUB_SECRET).update(raw).digest();
-  if (sig.length !== expSig.length || !crypto.timingSafeEqual(sig, expSig)) throw new Error("signature");
-  const payload = JSON.parse(raw.toString("utf8"));
-  if (!payload.email || !payload.email.includes("@")) throw new Error("email");
-  if (payload.exp && payload.exp < Math.floor(Date.now()/1000)) throw new Error("expired");
-  return payload.email;
+function base64urlToBuffer(b64url) {
+  const pad = 4 - (b64url.length % 4 || 4);
+  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat(pad === 4 ? 0 : pad);
+  return Buffer.from(b64, "base64");
 }
 
-async function suppress(email, reason="user_unsubscribe", source="one_click") {
-  if (!pool) return;
-  const sql = `
-    CREATE TABLE IF NOT EXISTS suppression(
-      email TEXT PRIMARY KEY,
-      reason TEXT,
-      source TEXT,
-      ts TIMESTAMPTZ DEFAULT now()
-    );
-    INSERT INTO suppression(email, reason, source)
-    VALUES($1,$2,$3)
-    ON CONFLICT (email) DO UPDATE
-      SET reason = EXCLUDED.reason,
-          source = EXCLUDED.source,
-          ts     = now();
-  `;
-  const c = await pool.connect();
-  try { await c.query("BEGIN"); await c.query(sql, [email, reason, source]); await c.query("COMMIT"); }
-  catch (e) { await c.query("ROLLBACK"); console.error("DB suppress error:", e?.message || e); }
-  finally { c.release(); }
+function safeEqual(a, b) {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
 }
 
 export default async function handler(req, res) {
-  const { token } = req.query;
-  try {
-    const email = parseToken(token);
-    await suppress(email);
-
-    if (req.method === "POST") return res.status(200).end(); // Gmail/Yahoo one-click
-    const url = new URL(CONFIRM_URL); // human redirect
-    url.searchParams.set("email", email);
-    return res.status(302).setHeader("Location", url.toString()).end();
-
-  } catch (e) {
-    console.error("Unsubscribe error:", e?.message || e);
-    if (req.method === "POST") return res.status(200).end();
-    return res.status(400).send(e?.message || "Invalid or expired link.");
+  if (req.method !== "GET" && req.method !== "POST") {
+    res.setHeader("Allow", "GET, POST");
+    return res.status(405).end("Method Not Allowed");
   }
+
+  const { token } = req.query;
+  if (!token || typeof token !== "string") {
+    return res.status(400).send("missing token");
+  }
+
+  let raw, sig;
+  try {
+    const buf = base64urlToBuffer(token);
+    const dot = buf.lastIndexOf(46); // "."
+    if (dot < 1) throw new Error("bad token");
+    raw = buf.subarray(0, dot);
+    sig = buf.subarray(dot + 1);
+  } catch {
+    return res.status(400).send("bad token");
+  }
+
+  const expected = crypto.createHmac("sha256", UNSUB_SECRET).update(raw).digest();
+  if (!safeEqual(expected, sig)) {
+    return res.status(400).send("signature");
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(raw.toString("utf8"));
+  } catch {
+    return res.status(400).send("payload");
+  }
+
+  if (!payload.email || !payload.exp) {
+    return res.status(400).send("payload");
+  }
+  if (Date.now() / 1000 > Number(payload.exp)) {
+    return res.status(400).send("expired");
+  }
+
+  // TODO: save to DB later if needed (Neon)
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  return res.status(200).send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Unsubscribed</title></head>
+<body style="font-family:Arial,Helvetica,sans-serif;padding:24px;">
+  <h1 style="margin:0 0 8px;">You're unsubscribed</h1>
+  <p style="margin:0 0 10px;">${payload.email} was removed successfully.</p>
+  <p style="margin:0;color:#6b7280;font-size:12px;">You won't receive further emails from us. If this was a mistake, reply to any previous email and we'll re-add you.</p>
+</body></html>`);
 }
-export const config = { runtime: "nodejs" };
