@@ -6,8 +6,10 @@ const { Pool } = pg;
 // --- secrets / env ---
 const UNSUB_SECRET =
   process.env.UNSUB_SECRET ||
-  "3ExsYR4nlnttgnHxpDDKM5V0JNQpJKlR3JuvqyOXTAM"; // keep env in Vercel; fallback stays for convenience
+  "3ExsYR4nlnttgnHxpDDKM5V0JNQpJKlR3JuvqyOXTAM"; // keep real secret in Vercel
 const DATABASE_URL = process.env.DATABASE_URL;
+const VISIBLE_UNSUB_REDIRECT =
+  process.env.VISIBLE_UNSUB_REDIRECT || ""; // e.g., https://appshaiskn.com/pages/unsubscribe
 
 // --- pg pool (singleton across hot-reloads) ---
 let pool = globalThis.__unsub_pool;
@@ -41,8 +43,16 @@ function esc(s) {
   );
 }
 
+function maskEmail(email) {
+  // mask local part after first 2 chars; keep domain as-is
+  const [local, domain] = String(email).split("@");
+  if (!domain) return email;
+  if (local.length <= 2) return `${local[0] || ""}***@${domain}`;
+  return `${local.slice(0, 2)}***@${domain}`;
+}
+
 async function saveSuppression(email, source) {
-  if (!pool) return; // no DB configured; still continue (unsub shouldn't fail)
+  if (!pool) return; // no DB configured; don't block UX
   await pool.query(
     `INSERT INTO suppression (email, source, reason)
      VALUES ($1, $2, 'user-request')
@@ -56,6 +66,9 @@ async function saveSuppression(email, source) {
 
 // --- handler ---
 export default async function handler(req, res) {
+  // never cache unsubscribe responses
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+
   if (req.method !== "GET" && req.method !== "POST") {
     res.setHeader("Allow", "GET, POST");
     return res.status(405).end("Method Not Allowed");
@@ -106,17 +119,31 @@ export default async function handler(req, res) {
   }
 
   if (req.method === "POST") {
-    // For Gmail/Yahoo one-click: no body needed
+    // Gmail/Yahoo one-click: must be 204 with no body
     return res.status(204).end();
   }
 
-  // Human confirmation page
+  // Human flow (GET):
+  const masked = maskEmail(email);
+
+  if (VISIBLE_UNSUB_REDIRECT) {
+    // redirect to your site and show masked email via querystring
+    const url = new URL(VISIBLE_UNSUB_REDIRECT);
+    url.searchParams.set("status", "success");
+    url.searchParams.set("email", masked);
+    res.setHeader("Location", url.toString());
+    return res.status(302).end();
+  }
+
+  // Fallback inline confirmation page
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   return res.status(200).send(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Unsubscribed</title></head>
 <body style="font-family:Arial,Helvetica,sans-serif;padding:24px;">
   <h1 style="margin:0 0 8px;">You're unsubscribed</h1>
-  <p style="margin:0 0 10px;">${esc(email)} was removed successfully.</p>
-  <p style="margin:0;color:#6b7280;font-size:12px;">You won't receive further emails from us. If this was a mistake, reply to any previous email and we'll re-add you.</p>
+  <p style="margin:0 0 10px;">${esc(masked)} was removed successfully.</p>
+  <p style="margin:0;color:#6b7280;font-size:12px;">
+    You won't receive further emails from us. If this was a mistake, reply to any previous email and we'll re-add you.
+  </p>
 </body></html>`);
 }
