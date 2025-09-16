@@ -6,7 +6,7 @@ const { Pool } = pg;
 // -------------------- ENV --------------------
 const UNSUB_SECRET =
   process.env.UNSUB_SECRET ||
-  "3ExsYR4nlnttgnHxpDDKM5V0JNQpJKlR3JuvqyOXTAM"; // put real secret in Vercel
+  "3ExsYR4nlnttgnHxpDDKM5V0JNQpJKlR3JuvqyOXTAM"; // keep real secret in Vercel
 const DATABASE_URL = process.env.DATABASE_URL;
 
 // Leave this EMPTY in Vercel to show the inline page on GET.
@@ -59,10 +59,10 @@ async function saveSuppression(email, source) {
   if (!pool) return; // no DB configured; don't block UX
   await pool.query(
     `CREATE TABLE IF NOT EXISTS suppression (
-       email TEXT PRIMARY KEY,
+       email  TEXT PRIMARY KEY,
        source TEXT NOT NULL,
        reason TEXT NOT NULL,
-       ts TIMESTAMPTZ NOT NULL DEFAULT now()
+       ts     TIMESTAMPTZ NOT NULL DEFAULT now()
      );`
   );
   await pool.query(
@@ -71,14 +71,13 @@ async function saveSuppression(email, source) {
      ON CONFLICT (email) DO UPDATE
        SET source = EXCLUDED.source,
            reason = EXCLUDED.reason,
-           ts = now()`,
+           ts     = now()`,
     [email, source]
   );
 }
 
 // -------------------- HANDLER --------------------
 export default async function handler(req, res) {
-  // Never cache unsubscribe responses
   res.setHeader("Cache-Control", "no-store, max-age=0");
 
   if (req.method !== "GET" && req.method !== "POST") {
@@ -86,21 +85,24 @@ export default async function handler(req, res) {
     return res.status(405).end("Method Not Allowed");
   }
 
-  // token may come as string or [string]
-  const q = req.query || {};
-  const token = Array.isArray(q.token) ? q.token[0] : q.token;
+  const token = Array.isArray(req.query.token)
+    ? req.query.token[0]
+    : req.query.token;
+
   if (!token || typeof token !== "string") {
     return res.status(400).send("missing token");
   }
 
-  // Decode token: base64url(payloadJSON + "." + HMAC)
+  // ---- Robust token split: [JSON][.][HMAC(32 bytes)] ----
   let raw, sig;
   try {
     const buf = base64urlToBuffer(token);
-    const dot = buf.lastIndexOf(46); // byte value of "."
-    if (dot < 1) throw new Error("bad token");
-    raw = buf.subarray(0, dot);
-    sig = buf.subarray(dot + 1);
+    // HMAC-SHA256 = 32 bytes, separator '.' = 1 byte
+    if (buf.length < 33) throw new Error("bad token");
+    sig = buf.subarray(buf.length - 32);
+    const sep = buf[buf.length - 33];
+    if (sep !== 46) throw new Error("bad token"); // 46 = '.'
+    raw = buf.subarray(0, buf.length - 33);
   } catch {
     return res.status(400).send("bad token");
   }
@@ -128,23 +130,22 @@ export default async function handler(req, res) {
 
   const email = String(payload.email).trim().toLowerCase();
 
-  // Save suppression; POST means one-click (machine), GET means human click
+  // Save suppression; POST = one-click, GET = human click
   try {
     await saveSuppression(email, req.method === "POST" ? "one-click" : "web");
   } catch (e) {
-    console.error("suppression save failed:", e); // don't break UX
+    console.error("suppression save failed:", e);
   }
 
-  // One-click requirement: POST must be 204 with no body
+  // POST must be 204 for one-click
   if (req.method === "POST") {
     return res.status(204).end();
   }
 
-  // Human flow (GET)
+  // Human flow
   const masked = maskEmail(email);
 
   if (VISIBLE_UNSUB_REDIRECT) {
-    // Optional redirect to your own page; attach masked email
     const url = new URL(VISIBLE_UNSUB_REDIRECT);
     url.searchParams.set("status", "success");
     url.searchParams.set("email", masked);
@@ -152,7 +153,7 @@ export default async function handler(req, res) {
     return res.status(302).end();
   }
 
-  // Inline branded confirmation page on the subdomain
+  // Inline branded confirmation page
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   return res.status(200).send(`<!doctype html>
 <html lang="en">
@@ -185,7 +186,7 @@ export default async function handler(req, res) {
         <div class="brand">APP SHAISKN</div>
       </div>
       <h1>You're unsubscribed</h1>
-      <p>You will no longer receive marketing emails from <strong>APP SHAISKN</strong> at <strong>${esc(masked)}</strong>.</p>
+      <p>You will no longer receive marketing emails from <strong>APP SHAISKN</strong> at <strong>${esc(maskEmail(email))}</strong>.</p>
       <div class="actions">
         <a class="btn btn-primary" href="https://appshaiskn.com">Return to Homepage</a>
         <a class="btn btn-outline" href="mailto:info@appshaiskn.com?subject=Unsubscribe%20Help">Contact Support</a>
